@@ -8,10 +8,16 @@
                           model must match a single-process reference for every
                           parameter, covering all four communication strategies
                           (all_to_all, agrs, local, subgroup_allgather).
+4. TestMuonSwap        — Single-GPU correctness: ``swap=True`` must match
+                          ``swap=False`` for every parameter (state relocation to
+                          pinned CPU memory must not change the math), and the
+                          optimizer momentum/variance must reside on pinned CPU
+                          memory when swap is enabled and on the device otherwise.
 """
 
 import copy
 import math
+import os
 from typing import Callable, overload
 
 import parametrize
@@ -19,6 +25,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.testing._internal.common_distributed import DistributedTestBase
 
 from xtuner._testing.testcase import DeterministicDDPTestCase
 from xtuner.v1.config import FSDPConfig
@@ -26,6 +33,7 @@ from xtuner.v1.config.optim import MuonConfig
 from xtuner.v1.model.base import BaseModel, XTunerBaseModelConfig
 from xtuner.v1.module.decoder_layer.dense_decoder_layer import DenseMLP
 from xtuner.v1.optim.muon import zeropower_via_newtonschulz5
+from xtuner.v1.utils.device import get_device
 
 
 # ─── Test: Newton-Schulz functions ───────────────────────────────────────────
@@ -360,6 +368,119 @@ class TestMuonSingleGPU(DeterministicDDPTestCase):
                 atol=1e-6,
                 rtol=1e-5,
                 msg=f"mismatch on '{name}': max_abs={abs_diff.max().item():.2e}, max_rel={rel_diff.max().item():.2e}",
+            )
+
+
+# ─── Test: swap (pinned-CPU optimizer state) ────────────────────────────────
+
+
+class TestMuonSwap(DeterministicDDPTestCase):
+    @property
+    def world_size(self) -> int:
+        return 1
+
+    def backend(self, device) -> str:
+        # The upstream base maps only cuda/hpu/xpu → nccl/hccl/xccl and falls back
+        # to gloo for everything else, so NPU would init a gloo group whose
+        # collectives reject npu tensors ("No backend type associated with
+        # device type npu"). Map NPU to hccl explicitly.
+        if "npu" in device:
+            return "hccl"
+        return super().backend(device)
+
+    def create_pg(self, device):
+        if "npu" in device:
+            torch.npu.set_device(self.rank)
+        ret = DistributedTestBase.create_pg(self, device)
+        os.environ["LOCAL_RANK"] = str(dist.get_rank())
+        os.environ["LOCAL_WORLD_SIZE"] = str(self.world_size)
+        if device == "cuda" or (isinstance(device, torch.device) and device.type == "cuda"):
+            torch.cuda.set_device(dist.get_rank() % torch.cuda.device_count())
+        return ret
+
+    def test_swap_matches_no_swap(self):
+        """``swap=True`` must be numerically identical to ``swap=False``.
+
+        Relocating optimizer state to pinned CPU memory only changes where the
+        momentum/variance live, not the math: every parameter must match the
+        no-swap path within tight tolerances. ``fully_shard()`` is required
+        because production Muon assumes DTensor parameters; with world_size=1 it
+        is a no-op sharding-wise. ``MuonConfig(swap=True)`` exercises the swap
+        wrappers for both the Muon and AdamW task paths, covering all param
+        categories of the ToyMoEModel. Runs on the active accelerator (NPU on
+        Ascend, CUDA where available) via ``get_device()``.
+        """
+        device = get_device()
+        self.create_pg(device)
+
+        LR = 0.01
+        MU = 0.95
+        WD = 0.01
+        EPSILON = 1e-8
+        BETAS = (0.9, 0.95)
+
+        # ── Build two identical models ───────────────────────────────────────
+        torch.manual_seed(42)
+        config = ToyMoEModelConfig(compile_cfg=False)
+        model_off = config.build().to(device)
+        model_on = copy.deepcopy(model_off)
+        input_ids = torch.randint(0, config.vocab_size, (2, 8), device=device)
+
+        fsdp_config = FSDPConfig(
+            param_dtype=torch.float32,
+            reduce_dtype=torch.float32,
+            torch_compile=False,
+        )
+        model_off.fully_shard(fsdp_config)
+        model_on.fully_shard(fsdp_config)
+
+        # ── swap=False path ──────────────────────────────────────────────────
+        loss_off = model_off(input_ids)
+        loss_off.backward()
+        opt_off = MuonConfig(
+            lr=LR, momentum=MU, weight_decay=WD, eps=EPSILON, betas=BETAS, swap=False
+        ).build(model_off)
+        opt_off.step()
+
+        # ── swap=True path ───────────────────────────────────────────────────
+        loss_on = model_on(input_ids)
+        loss_on.backward()
+        opt_on = MuonConfig(
+            lr=LR, momentum=MU, weight_decay=WD, eps=EPSILON, betas=BETAS, swap=True
+        ).build(model_on)
+        opt_on.step()
+
+        # ── Compare all parameters (swap must not change the math) ────────────
+        for (name, p_off), (_, p_on) in zip(model_off.named_parameters(), model_on.named_parameters()):
+            full_off = p_off.data.full_tensor()  # type: ignore[attr-defined]
+            full_on = p_on.data.full_tensor()  # type: ignore[attr-defined]
+            abs_diff = (full_on - full_off).abs()
+            torch.testing.assert_close(
+                full_on,
+                full_off,
+                atol=1e-6,
+                rtol=1e-5,
+                msg=f"swap mismatch on '{name}': max_abs={abs_diff.max().item():.2e}",
+            )
+
+        # ── State placement: swap on → pinned CPU, swap off → device ─────────
+        for name, p in model_on.named_parameters():
+            st = opt_on.state.get(p)
+            if not st or "momentum" not in st:
+                continue
+            mom = st["momentum"]
+            assert mom.device.type == "cpu", (
+                f"swap=True but momentum for '{name}' on {mom.device}, expected cpu"
+            )
+            assert mom.is_pinned(), f"swap=True but momentum for '{name}' is not pinned"
+
+        for name, p in model_off.named_parameters():
+            st = opt_off.state.get(p)
+            if not st or "momentum" not in st:
+                continue
+            assert st["momentum"].device.type == device, (
+                f"swap=False but momentum for '{name}' on {st['momentum'].device}, "
+                f"expected {device}"
             )
 
 
